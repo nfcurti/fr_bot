@@ -31,6 +31,13 @@ export interface ClosedPnlEntry {
   updatedTime: number;
 }
 
+export interface WalletBalance {
+  coin: string;
+  totalEquity: number;
+  walletBalance: number;
+  availableBalance: number;
+}
+
 const API_BASE_URL = process.env.BYBIT_API_BASE_URL ?? "https://api.bybit.com";
 const RECV_WINDOW = "5000";
 const instrumentCache = new Map<string, InstrumentFilters>();
@@ -317,6 +324,68 @@ export async function getFundingHistory(symbol: string, startTime?: number, endT
   }
 
   return data.result?.list ?? [];
+}
+
+export async function getWalletBalance(coin: string = "USDT"): Promise<WalletBalance> {
+  const { apiKey, apiSecret } = assertCredentials();
+
+  const accountType = process.env.BYBIT_ACCOUNT_TYPE ?? "UNIFIED";
+  const url = new URL("/v5/account/wallet-balance", API_BASE_URL);
+  url.searchParams.set("accountType", accountType);
+  if (coin) {
+    url.searchParams.set("coin", coin);
+  }
+
+  const queryString = url.searchParams.toString();
+  const timestamp = Date.now().toString();
+  const payload = `${timestamp}${apiKey}${RECV_WINDOW}${queryString}`;
+  const signature = crypto.createHmac("sha256", apiSecret).update(payload).digest("hex");
+
+  const response = await fetch(url.toString(), {
+    method: "GET",
+    headers: {
+      "X-BAPI-API-KEY": apiKey,
+      "X-BAPI-TIMESTAMP": timestamp,
+      "X-BAPI-SIGN": signature,
+      "X-BAPI-RECV-WINDOW": RECV_WINDOW,
+    },
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Failed to fetch wallet balance: ${response.status} ${response.statusText} - ${text}`);
+  }
+
+  const payloadJson = await response.json();
+
+  if (payloadJson.retCode !== 0 || !payloadJson.result?.list?.[0]) {
+    throw new Error(payloadJson.retMsg ?? "Bybit rejected the wallet balance request.");
+  }
+
+  const account = payloadJson.result.list[0];
+  const coins: Array<Record<string, unknown>> = account.coin ?? [];
+  const target = coins.find((entry) => entry.coin === coin) ?? coins[0];
+
+  if (!target) {
+    throw new Error(`Wallet balance for coin ${coin} not available.`);
+  }
+
+  const toNum = (value: unknown): number => {
+    const num = Number(value);
+    return Number.isFinite(num) ? num : 0;
+  };
+
+  const totalEquity = toNum(target.equity ?? target.walletBalance ?? target.totalEquity);
+  const walletBalance = toNum(target.walletBalance ?? target.wallet ?? totalEquity);
+  const availableBalance = toNum(target.availableToWithdraw ?? target.availableBalance ?? target.available ?? walletBalance);
+  const resolvedCoin = typeof target.coin === "string" ? target.coin : coin;
+
+  return {
+    coin: resolvedCoin,
+    totalEquity,
+    walletBalance,
+    availableBalance,
+  };
 }
 
 export async function getClosedPnl(startTime?: number, endTime?: number): Promise<ClosedPnlEntry[]> {

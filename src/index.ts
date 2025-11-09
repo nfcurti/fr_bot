@@ -42,6 +42,7 @@ import {
   getFundingHistory,
   getOrderExecutions,
   getPositionSize,
+  getWalletBalance,
   placeLimitOrder,
   TradeSide,
 } from "../lib/bybit-trading";
@@ -53,7 +54,8 @@ const POST_FUNDING_MS = 5_000;
 const FUNDING_THRESHOLD = 0.005; // 0.5%
 const TRADE_NOTIONAL_USD = 500;
 const MAX_CLOSE_ATTEMPTS = 5;
-const DAILY_STOP_LOSS = -(TRADE_NOTIONAL_USD * 0.1); // -10%
+const MAX_DRAWDOWN_PCT = 0.03; // 3%
+const ACCOUNT_COIN = process.env.BYBIT_ACCOUNT_COIN ?? "USDT";
 
 interface ScheduledTrade {
   fundingTime: number;
@@ -83,8 +85,9 @@ const schedules = new Map<string, ScheduledTrade>();
 const activePositions = new Map<string, ActivePosition>();
 const latestTickers = new Map<string, BybitFundingTicker>();
 const openingSymbols = new Set<string>();
-let dailyPnl = 0;
 let tradingEnabled = true;
+let startingEquity: number | null = null;
+let drawdownLimitUsd = 0;
 
 function parseFundingTimestamp(value?: string): number | null {
   if (!value) return null;
@@ -227,20 +230,44 @@ async function finalizePosition(symbol: string) {
     const grossPnl = entrySummary.tradePnl + closeSummary.tradePnl;
     const totalFees = entrySummary.fee + closeSummary.fee;
     const fundingFee = await fetchFundingFee(symbol, position.openedAt - 30 * 60 * 1000, Date.now());
-    const netPnl = grossPnl - totalFees - fundingFee;
 
-    dailyPnl += netPnl;
+    let currentEquity: number | null = null;
+    let equityChange: number | null = null;
+    let drawdown: number | null = null;
 
-    console.log(
-      `[${nowIso()}] ${symbol} closed · Gross ${formatUsd(grossPnl)} · Fees ${formatUsd(-totalFees)} · Funding ${formatUsd(fundingFee)} · Net ${formatUsd(netPnl)} · 24h PnL ${formatUsd(dailyPnl)}`
-    );
+    try {
+      const balance = await getWalletBalance(ACCOUNT_COIN);
+      currentEquity = balance.totalEquity;
+      if (startingEquity !== null) {
+        equityChange = currentEquity - startingEquity;
+        drawdown = startingEquity - currentEquity;
+      }
+      const equityDisplay = currentEquity !== null ? formatUsd(currentEquity) : "n/a";
+      const changeDisplay = equityChange !== null ? ` · Change ${formatUsd(equityChange)}` : "";
+      const drawdownDisplay =
+        drawdown !== null ? ` · Drawdown ${formatUsd(drawdown)} (limit ${formatUsd(drawdownLimitUsd)})` : "";
 
-    if (dailyPnl <= DAILY_STOP_LOSS && tradingEnabled) {
-      console.error(
-        `[${nowIso()}] Daily PnL ${formatUsd(dailyPnl)} breached stop-loss ${formatUsd(DAILY_STOP_LOSS)}. Halting strategy.`
+      console.log(
+        `[${nowIso()}] ${symbol} closed · Gross ${formatUsd(grossPnl)} · Fees ${formatUsd(
+          -totalFees
+        )} · Funding ${formatUsd(fundingFee)} · Equity ${equityDisplay}${changeDisplay}${drawdownDisplay}`
       );
-      tradingEnabled = false;
-      await shutdown();
+    } catch (error) {
+      console.error(`[${nowIso()}] Failed to refresh wallet balance after closing ${symbol}:`, error);
+    }
+
+    if (startingEquity !== null && currentEquity !== null && drawdown !== null) {
+      if (drawdown >= drawdownLimitUsd && tradingEnabled) {
+        console.error(
+          `[${nowIso()}] Max drawdown reached. Starting equity ${formatUsd(
+            startingEquity
+          )} · Current equity ${formatUsd(currentEquity)} · Drawdown ${formatUsd(drawdown)} (limit ${formatUsd(
+            drawdownLimitUsd
+          )}). Halting strategy.`
+        );
+        tradingEnabled = false;
+        await shutdown();
+      }
     }
   } catch (error) {
     console.error(`[${nowIso()}] Failed to finalize position for ${symbol}:`, error);
@@ -310,75 +337,76 @@ async function openPosition(symbol: string, fundingTime: number) {
   if (openingSymbols.has(symbol) || activePositions.has(symbol)) return;
 
   openingSymbols.add(symbol);
-
-  let ticker = latestTickers.get(symbol);
   try {
-    const refreshed = await fetchFundingTicker(symbol);
-    if (refreshed) {
-      ticker = refreshed;
-      latestTickers.set(symbol, refreshed);
+    let ticker = latestTickers.get(symbol);
+    try {
+      const refreshed = await fetchFundingTicker(symbol);
+      if (refreshed) {
+        ticker = refreshed;
+        latestTickers.set(symbol, refreshed);
+      }
+    } catch (error) {
+      console.error(`[${nowIso()}] Failed to refresh ticker for ${symbol}:`, error);
     }
-  } catch (error) {
-    console.error(`[${nowIso()}] Failed to refresh ticker for ${symbol}:`, error);
-  }
 
-  if (!ticker) {
-    console.warn(`[${nowIso()}] Missing ticker snapshot for ${symbol}, skipping open.`);
-    return;
-  }
+    if (!ticker) {
+      console.warn(`[${nowIso()}] Missing ticker snapshot for ${symbol}, skipping open.`);
+      return;
+    }
 
-  const fundingRate = ticker.fundingRate ?? 0;
-  if (Math.abs(fundingRate) < FUNDING_THRESHOLD) {
-    console.warn(`[${nowIso()}] ${symbol} funding ${fundingRate} below threshold, skipping.`);
-    return;
-  }
+    const fundingRate = ticker.fundingRate ?? 0;
+    if (Math.abs(fundingRate) < FUNDING_THRESHOLD) {
+      console.warn(`[${nowIso()}] ${symbol} funding ${fundingRate} below threshold, skipping.`);
+      return;
+    }
 
-  const side: TradeSide = fundingRate >= 0 ? "Sell" : "Buy";
-  const referencePrice = ticker.markPrice ?? ticker.lastPrice ?? ticker.bidPrice ?? ticker.askPrice;
+    const side: TradeSide = fundingRate >= 0 ? "Sell" : "Buy";
+    const referencePrice = ticker.markPrice ?? ticker.lastPrice ?? ticker.bidPrice ?? ticker.askPrice;
 
-  if (!referencePrice || referencePrice <= 0) {
-    console.error(`[${nowIso()}] Missing reference price for ${symbol}, cannot open.`);
-    return;
-  }
+    if (!referencePrice || referencePrice <= 0) {
+      console.error(`[${nowIso()}] Missing reference price for ${symbol}, cannot open.`);
+      return;
+    }
 
-  const rawQty = TRADE_NOTIONAL_USD / referencePrice;
+    const rawQty = TRADE_NOTIONAL_USD / referencePrice;
 
-  try {
-    const result = await placeLimitOrder({
-      symbol,
-      side,
-      price: referencePrice,
-      qty: rawQty,
-      reduceOnly: false,
-    });
+    try {
+      const result = await placeLimitOrder({
+        symbol,
+        side,
+        price: referencePrice,
+        qty: rawQty,
+        reduceOnly: false,
+      });
 
-    const entryPrice = Number(result.price ?? referencePrice);
-    const qty = Number(result.qty ?? rawQty);
+      const entryPrice = Number(result.price ?? referencePrice);
+      const qty = Number(result.qty ?? rawQty);
 
-    const closeDelay = Math.max(fundingTime + POST_FUNDING_MS - Date.now(), 500);
-    const closeTimer = setTimeout(() => {
-      void closePosition(symbol);
-    }, closeDelay);
+      const closeDelay = Math.max(fundingTime + POST_FUNDING_MS - Date.now(), 500);
+      const closeTimer = setTimeout(() => {
+        void closePosition(symbol);
+      }, closeDelay);
 
-    activePositions.set(symbol, {
-      symbol,
-      side,
-      qty,
-      entryPrice,
-      fundingTime,
-      openedAt: Date.now(),
-      entryOrderLinkId: result.orderLinkId,
-      closeOrderLinkIds: [],
-      closeTimer,
-    });
+      activePositions.set(symbol, {
+        symbol,
+        side,
+        qty,
+        entryPrice,
+        fundingTime,
+        openedAt: Date.now(),
+        entryOrderLinkId: result.orderLinkId,
+        closeOrderLinkIds: [],
+        closeTimer,
+      });
 
-    console.log(
-      `[${nowIso()}] Opened ${symbol} ${side} @ ${entryPrice} (qty ${qty}) · close scheduled in ${Math.round(
-        closeDelay / 1000
-      )}s.`
-    );
-  } catch (error) {
-    console.error(`[${nowIso()}] Failed to open ${symbol}:`, error);
+      console.log(
+        `[${nowIso()}] Opened ${symbol} ${side} @ ${entryPrice} (qty ${qty}) · close scheduled in ${Math.round(
+          closeDelay / 1000
+        )}s.`
+      );
+    } catch (error) {
+      console.error(`[${nowIso()}] Failed to open ${symbol}:`, error);
+    }
   } finally {
     openingSymbols.delete(symbol);
   }
@@ -492,6 +520,22 @@ async function shutdown() {
 
 async function main() {
   console.log(`[${nowIso()}] Starting Bybit funding strategy bot.`);
+
+  try {
+    const balance = await getWalletBalance(ACCOUNT_COIN);
+    startingEquity = balance.totalEquity;
+    drawdownLimitUsd = startingEquity * MAX_DRAWDOWN_PCT;
+    const drawdownPct = (MAX_DRAWDOWN_PCT * 100).toFixed(1);
+
+    console.log(
+      `[risk] Portfolio snapshot (${balance.coin}) · Total equity ${formatUsd(startingEquity)} · Available ${formatUsd(
+        balance.availableBalance
+      )} · Max drawdown ${formatUsd(drawdownLimitUsd)} (${drawdownPct}%)`
+    );
+  } catch (error) {
+    console.error(`[risk] Failed to load wallet balance for ${ACCOUNT_COIN}:`, error);
+    throw error;
+  }
 
   pollHandle = setInterval(() => {
     void pollTickers();
