@@ -36,15 +36,15 @@ if (!hasApiKey || !hasApiSecret) {
   );
 }
 
-import type { BybitFundingTicker } from "../../../lib/bybit-top-funding";
-import { fetchFundingTicker, fetchTopFundingTickers } from "../../../lib/bybit-top-funding";
+import type { BybitFundingTicker } from "../lib/bybit-top-funding";
+import { fetchFundingTicker, fetchTopFundingTickers } from "../lib/bybit-top-funding";
 import {
   getFundingHistory,
   getOrderExecutions,
   getPositionSize,
   placeLimitOrder,
   TradeSide,
-} from "../../../lib/bybit-trading";
+} from "../lib/bybit-trading";
 
 const POLL_INTERVAL_MS = 1000;
 const MONITOR_INTERVAL_MS = 60_000;
